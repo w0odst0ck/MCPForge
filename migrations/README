@@ -1,0 +1,21 @@
+# 数据库迁移
+
+## 初始化
+```shell
+alembic init migrations
+```
+
+## 创建迁移
+```shell
+alembic revision --autogenerate -m "description"
+```
+
+## 执行迁移
+```shell
+alembic upgrade head
+```
+
+## 回滚
+```shell
+alembic downgrade -1
+```

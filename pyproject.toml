@@ -1,0 +1,46 @@
+[project]
+name = "mcp-server-template"
+version = "0.1.0"
+description = "通用 MCP Server 脚手架 — FastAPI + FastMCP 集成模板"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]==0.115.12",
+    "loguru==0.7.3",
+    "mcp==1.8.1",
+    "pydantic-settings==2.9.1",
+    "uvicorn[standard]>=0.34.0",
+]
+
+# ── 可选功能依赖（按需取消注释） ──────────────────────────────
+# 数据库
+# "sqlmodel>=0.0.24",
+# "alembic>=1.15.2",
+# "pymysql>=1.1.1",
+
+# 向量检索
+# "pymilvus>=2.5.8",
+
+# LLM
+# "openai>=1.79.0",
+# "httpx>=0.28.0",
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
+default = true
+
+[dependency-groups]
+dev = [
+    "coverage>=7.8.0",
+    "mcp[cli]==1.8.1",
+    "pytest>=8.3.5",
+    "ruff>=0.11.10",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+lint.select = ["E", "F", "I", "B", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
