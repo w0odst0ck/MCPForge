@@ -160,22 +160,6 @@ docker compose up -d
 | `DATABASE_URL` | 数据库连接（可选） | `None` |
 | `LOG_LEVEL` | 日志级别 | `INFO` |
 
-## 从旧项目迁移
-
-如果你有之前基于 FastAPI + FastMCP 的项目（如 wx-mcp），迁移步骤：
-
-1. 复制 `app/routers/` 下的业务模块到新模板
-2. 在 `app/main.py` 中注册
-3. 补充缺失的依赖到 `pyproject.toml`
-4. 复制 `.env` 配置
-
-## 后续扩展方向
-
-- **知识库模块** — 对接本地文档，提供语义搜索工具
-- **数据查询模块** — 对接数据库，提供 NL→SQL 工具
-- **电商分析模块** — 商品搜索、价格分析、比价工具
-- **自动化模块** — 文件处理、数据导出、定时任务
-
 ## 参考
 
 - [MCP 官方文档](https://modelcontextprotocol.io/introduction)
