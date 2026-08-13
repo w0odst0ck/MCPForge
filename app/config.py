@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     BACKEND_CORS_ORIGINS: Annotated[list[AnyUrl | str] | str, BeforeValidator(parse_cors)] = [
         "http://localhost:3000",
         "http://localhost:5173",
+        "https://mojin.store",
+        "https://w0odst0ck.github.io",
     ]
 
     @computed_field
