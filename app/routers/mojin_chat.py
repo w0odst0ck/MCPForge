@@ -3,15 +3,18 @@
 仿照 app/routers/example.py 范式：每个业务函数同时是 MCP 工具（@mcp.tool()）
 与 FastAPI GET 端点（@router.get）。
 
-三个工具：
+四个工具：
 - answer_question(query, lang)：RAG 全链路问答（multi-query → hybrid search → rerank → 压缩 → LLM）
 - search_products(query, lang)：语义检索产品（embed → dense search → 可选 rerank）
 - order_help(query, lang)：同 answer_question，但检索限定 category in (shipping, support)
+- conversation(session_id, query, lang)：多轮对话，检索 query = 当前问题 + 最近一轮历史（指代消解）
 
 设计要点：
 - 懒初始化：Milvus / LLM / Reranker client 首次调用才创建（import 即连库是大忌）
 - 异常兜底：model server / DeepSeek 失败返回友好错误 + 转人工引导，不抛 500 裸异常
 - 日志只记 query/lang/elapsed/hit_count/来源，绝不记录 API key
+- 可观测：三个问答端点（answer_question / order_help / conversation）每次问答落库
+  chat_logs（data/chat.db），query 含疑似 PII 时以 [PII 已脱敏] 占位（沙特 PDPL）
 """
 
 from __future__ import annotations
@@ -115,6 +118,16 @@ def _get_llm():
                 base_url=kb_settings.LLM_URL,
             )
     return _clients["llm"]  # type: ignore[return-value]
+
+
+def _get_store():
+    """ChatStore（懒加载：首次调用建表 + 启动清理过期会话/日志）。"""
+    with _clients_lock:
+        if "store" not in _clients:
+            from app.knowledge.store import get_chat_store
+
+            _clients["store"] = get_chat_store()
+    return _clients["store"]  # type: ignore[return-value]
 
 
 # ── 高频问题 TTL-LRU 缓存 ──────────────────────────────────────────
@@ -479,6 +492,92 @@ def _run_search_products(query: str, lang: str) -> Dict:
     return {"results": items, "hit_count": len(items), "elapsed_ms": elapsed}
 
 
+# ── 多轮对话与问答日志 ──────────────────────────────────────────
+
+def _append_history_turn(history: List[dict], user_q: str, assistant_a: str, max_rounds: int) -> List[dict]:
+    """追加一轮对话（user_q + assistant_a），截断只保留最近 max_rounds 轮（超长截断）。"""
+    history = list(history)
+    history.append({"role": "user", "content": user_q})
+    history.append({"role": "assistant", "content": assistant_a})
+    max_msgs = max_rounds * 2
+    if len(history) > max_msgs:
+        history = history[-max_msgs:]
+    return history
+
+
+def _build_conversation_query(query: str, history: List[dict], max_chars: int = 300) -> str:
+    """多轮检索 query = 当前问题 + 最近 1 轮历史（user_q + assistant_a）拼接。
+
+    用于指代消解（如「那退换呢」需结合上轮「配送多久」的上下文）；
+    不做 LLM 改写，直接把最近 2 条消息拼在 query 后，每段按 max_chars 截断防超长。
+    """
+    if not history:
+        return query
+    parts: List[str] = []
+    for msg in history[-2:]:  # 最近一轮 = user + assistant 两条消息
+        role = "用户" if msg.get("role") == "user" else "客服"
+        content = str(msg.get("content", "")).strip()[:max_chars]
+        if content:
+            parts.append(f"{role}: {content}")
+    if not parts:
+        return query
+    return f"{query}\n[历史] " + " ".join(parts)
+
+
+def _log_qa(session_id: Optional[str], lang: str, query: str, result: Dict) -> None:
+    """问答日志落库（所有问答端点，含成功与转人工）。失败仅告警，不影响主流程。
+
+    隐私（沙特 PDPL）：query 含疑似 PII（连续 8+ 数字）时由 store 层以 [PII 已脱敏] 落库，
+    绝不记录手机号/地址/姓名。
+    """
+    try:
+        sources = [s.get("doc_id", "") for s in result.get("sources", []) if isinstance(s, dict)]
+        _get_store().append_log(
+            session_id=session_id,
+            lang=lang,
+            query=query,
+            answer=str(result.get("answer", "")),
+            hit_count=int(result.get("hit_count", 0) or 0),
+            elapsed_ms=int(result.get("elapsed_ms", 0) or 0),
+            sources=sources,
+            is_handoff=1 if (result.get("hit_count", 0) == 0 or result.get("error")) else 0,
+        )
+    except Exception as e:
+        log.warning("qa log write failed | err={}", type(e).__name__)
+
+
+def _run_conversation(session_id: str, query: str, lang: str) -> Dict:
+    """多轮对话：检索 = 当前问题 + 最近一轮历史；会话历史按 session_id 续接。
+
+    不缓存（多轮场景重复问概率低，简单正确优先，避免命中单轮缓存答非所问）；
+    每次请求更新会话表（截断到最近 N 轮）+ 写问答日志。
+    """
+    t0 = time.perf_counter()
+    lang = _check_lang(lang)
+    store = _get_store()
+
+    # 1. 读历史 → 构造检索 query（当前问题 + 最近一轮历史，指代消解）
+    session = store.get_session(session_id)
+    history: List[dict] = session["history"] if session else []
+    search_query = _build_conversation_query(query, history)
+    log.info("conversation start | session_id={} lang={} rounds={}", session_id, lang, len(history) // 2)
+
+    # 2. 检索问答（走 _run_answer_impl，绕开单轮缓存）
+    result = _run_answer_impl(search_query, lang)
+
+    # 3. 追加本轮历史并落库（截断到最近 N 轮）
+    history = _append_history_turn(
+        history, query, str(result.get("answer", "")), kb_settings.SESSION_MAX_ROUNDS
+    )
+    store.upsert_session(session_id, lang, history)
+
+    # 4. 问答日志（session_id 原样回传 + 记录）
+    _log_qa(session_id, lang, query, result)
+    result["session_id"] = session_id
+    result["elapsed_ms"] = int((time.perf_counter() - t0) * 1000)
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════
 #  MCP 工具 — 同时作为 HTTP GET 端点
 # ═══════════════════════════════════════════════════════════════
@@ -494,7 +593,24 @@ async def answer_question(query: str, lang: str = "en") -> Dict:
     """
     _check_lang(lang)
     log.info("answer_question called | query={} lang={}", query, lang)
-    return await run_in_threadpool(_run_answer, query, lang)
+    result = await run_in_threadpool(_run_answer, query, lang)
+    _log_qa(None, lang, query, result)
+    return result
+
+
+@mcp.tool()
+@router.get("/conversation")
+async def conversation(session_id: str, query: str, lang: str = "en") -> Dict:
+    """多轮对话问答：基于知识库回答，支持连续追问（指代消解）
+
+    Args:
+        session_id: 会话 ID，由调用方（widget）生成并维护；首次出现创建会话，后续续接
+        query: 客户问题（支持英语/中文/阿拉伯语）
+        lang: 回答语言，en | cn | ar，默认 en
+    """
+    _check_lang(lang)
+    log.info("conversation called | session_id={} lang={}", session_id, lang)
+    return await run_in_threadpool(_run_conversation, session_id, query, lang)
 
 
 @mcp.tool()
@@ -522,4 +638,6 @@ async def order_help(query: str, lang: str = "en") -> Dict:
     """
     _check_lang(lang)
     log.info("order_help called | query={} lang={}", query, lang)
-    return await run_in_threadpool(_run_answer, query, lang, ["shipping", "support"])
+    result = await run_in_threadpool(_run_answer, query, lang, ["shipping", "support"])
+    _log_qa(None, lang, query, result)
+    return result

@@ -80,6 +80,14 @@ class KnowledgeSettings(BaseSettings):
     MULTI_QUERY_MIN_BLOCKS: int = 50   # 知识库块数低于此值即使开启也跳过改写
     COMPRESS_RATE: float = 0.7         # BM25Compressor 保留比例
 
+    # ── 会话与问答日志（SQLite，data/chat.db） ────────────────
+    # 多轮对话会话表 + 问答日志表（运营可观测：高频问题/转人工率/命中率）。
+    # data/ 目录已加入 .gitignore，本地库文件不入仓。
+    CHAT_DB_PATH: str = str(MCPFORGE_ROOT / "data" / "chat.db")
+    SESSION_TTL_HOURS: int = 24    # 会话无更新超过该时长删除（启动 + 每日一次清理）
+    SESSION_MAX_ROUNDS: int = 6    # 会话保留最近 N 轮（每轮 = 用户问题 + AI 回答两条消息）
+    LOG_RETENTION_DAYS: int = 30   # 问答日志保留天数（滚动清理）
+
     def kb_collection(self, lang: str) -> str:
         return self.KB_COLLECTIONS[lang]
 
