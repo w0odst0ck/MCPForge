@@ -386,15 +386,25 @@ def _run_answer_impl(query: str, lang: str, categories: Optional[List[str]] = No
 
     top = scored[: kb_settings.RERANK_TOP_K]
 
-    # 3. BM25 压缩上下文
+    # 3. BM25 压缩上下文（小库跳过：句子数少时压缩会丢关键信息，直接喂 rerank 结果）
     from rag_toolkit.pipelines.context_expander import BM25Compressor
 
     context = "\n".join(f"[{m['doc_id']}] {m['text']}" for m, _ in top)
-    try:
-        compressor = BM25Compressor(rate=kb_settings.COMPRESS_RATE)
-        context = compressor.compress(context, query=query) or context
-    except Exception as e:
-        log.warning("context compression skipped | err={}", type(e).__name__)
+    if len(top) < kb_settings.RERANK_TOP_K or len(context) < 2000:
+        log.info("context compression skipped | top={} ctx_chars={}", len(top), len(context))
+    else:
+        try:
+            compressor = BM25Compressor(rate=kb_settings.COMPRESS_RATE)
+            compressed = compressor.compress(context, query=query)
+            if compressed and len(compressed) >= int(len(context) * 0.5):
+                context = compressed
+            else:
+                log.warning(
+                    "compressed context too short ({} -> {}), keep original",
+                    len(context), len(compressed or "")
+                )
+        except Exception as e:
+            log.warning("context compression skipped | err={}", type(e).__name__)
 
     # 4. DeepSeek 生成（失败兜底转人工）
     try:
