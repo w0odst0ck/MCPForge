@@ -9,7 +9,7 @@
 ```
 
 **FastAPI** 作为主容器，承载 HTTP 路由和中间件。
-**FastMCP** 挂载为子应用，通过 `streamable_http_app()` 暴露 MCP 协议端点。
+**FastMCP** 挂载为子应用，通过 `http_app()` 暴露 MCP 协议端点。
 
 ## 添加新模块
 
@@ -17,7 +17,7 @@
 
 ```python
 # 1. 创建新文件 app/routers/your_module.py
-mcp = FastMCP(name="your_module", stateless_http=True)
+mcp = FastMCP(name="your_module")
 router = APIRouter(prefix="/your_module", tags=["你的模块"])
 
 @mcp.tool()
@@ -27,9 +27,14 @@ async def your_tool(param: str) -> str:
     return f"result: {param}"
 
 # 2. 在 app/main.py 中注册
+from fastmcp.utilities.lifespan import combine_lifespans
 from app.routers import your_module
+
+your_module_app = your_module.mcp.http_app(path="/", stateless_http=True)
 app.include_router(your_module.router)
-app.mount("/your_module", app=your_module.mcp.streamable_http_app())
+app.mount("/your_module", app=your_module_app)
+# 并把 your_module_app.lifespan 合并进 FastAPI lifespan：
+# app = FastAPI(lifespan=combine_lifespans(lifespan, your_module_app.lifespan))
 ```
 
 ## 模块可同时做两件事

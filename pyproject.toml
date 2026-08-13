@@ -5,11 +5,12 @@ description = "通用 MCP Server 脚手架 — FastAPI + FastMCP 集成模板"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi[standard]==0.115.12",
+    "fastapi[standard]>=0.116,<1",
     "loguru==0.7.3",
-    "mcp==1.8.1",
+    "fastmcp>=3.4.6,<4",
     "pydantic-settings==2.9.1",
     "uvicorn[standard]>=0.34.0",
+    "rag-toolkit",
 ]
 
 # ── 可选功能依赖（按需取消注释） ──────────────────────────────
@@ -29,10 +30,13 @@ dependencies = [
 url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
 default = true
 
+[tool.uv.sources]
+rag-toolkit = { path = "../Rag-Toolkit", editable = true }
+
 [dependency-groups]
 dev = [
     "coverage>=7.8.0",
-    "mcp[cli]==1.8.1",
+    # fastmcp 自带 fastmcp CLI（dev/run/inspect），替代原 mcp[cli]
     "pytest>=8.3.5",
     "ruff>=0.11.10",
 ]

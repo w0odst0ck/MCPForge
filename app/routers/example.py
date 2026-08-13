@@ -15,15 +15,16 @@ MCP 工具注解:
 from typing import Dict, Optional
 
 from fastapi import APIRouter
-from mcp.server import FastMCP
+from fastmcp import FastMCP
 
 from app.config import settings
 from app.utils.log import log
 
 # ── MCP 实例 ──────────────────────────────────────────────────
 # name: MCP 工具命名空间，LLM 通过这个名字识别工具来源
-# stateless_http: 启用无状态 HTTP 传输模式
-mcp = FastMCP(name="example", stateless_http=True)
+# 注意: fastmcp 3.x 起 stateless_http 不再作为构造参数，
+# 需在挂载时通过 http_app(stateless_http=True) 传入（见 app/main.py）
+mcp = FastMCP(name="example")
 
 # ── FastAPI 路由 ──────────────────────────────────────────────
 router = APIRouter(prefix="/example", tags=["示例"])
@@ -54,8 +55,8 @@ async def system_info() -> Dict:
 
     返回当前运行环境的基础信息，方便调试排查。
     """
-    import platform
     import os
+    import platform
 
     return {
         "project": settings.PROJECT_NAME,

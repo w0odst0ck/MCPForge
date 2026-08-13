@@ -69,8 +69,8 @@ uv run fastapi dev app/main.py
 curl http://127.0.0.1:8000/example/hello
 # => "Hello, World! Running mcp-server-template v0.1.0"
 
-# MCP 协议端点（查看可用工具）
-curl http://127.0.0.1:8000/example/mcp/tools/list
+# MCP 协议端点（返回 MCP 端点信息，非 404 即挂载成功）
+curl http://127.0.0.1:8000/example
 ```
 
 ## 项目结构
@@ -115,8 +115,14 @@ mcp-server-template/
 ```python
 # app/main.py
 from app.routers import your_module
+from fastmcp.utilities.lifespan import combine_lifespans
+
+your_module_app = your_module.mcp.http_app(path="/", stateless_http=True)
 app.include_router(your_module.router)
-app.mount("/your_module", app=your_module.mcp.streamable_http_app())
+app.mount("/your_module", app=your_module_app)
+
+# 同时把 your_module_app.lifespan 合并进 FastAPI 的 lifespan：
+# app = FastAPI(lifespan=combine_lifespans(lifespan, your_module_app.lifespan))
 ```
 
 工具函数可以同时被 AI（通过 MCP）和浏览器（通过 HTTP）调用：

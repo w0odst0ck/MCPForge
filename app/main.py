@@ -18,13 +18,14 @@
     uv run fastapi dev app/main.py
 """
 
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastmcp.utilities.lifespan import combine_lifespans
 
 from app.config import settings
-from app.routers import example
+from app.routers import example, mojin_chat
 from app.utils.log import Loggers, log
 
 
@@ -32,29 +33,35 @@ from app.utils.log import Loggers, log
 async def lifespan(app: FastAPI):
     """应用生命周期管理。
 
-    - 启动时：初始化资源（数据库连接、MCP session manager 等）
+    - 启动时：初始化资源（数据库连接等）
     - 关闭时：清理资源
+
+    MCP session manager 的启停由 example_mcp_app.lifespan 管理，
+    通过 combine_lifespans 与本 lifespan 合并（见下方 FastAPI 构造）。
     """
-    async with AsyncExitStack() as stack:
-        # ── 启动初始化 ────────────────────────────────────
-        # 示例：启动 MCP session manager
-        await stack.enter_async_context(example.mcp.session_manager.run())
-        # TODO: 在此添加更多资源初始化（DB 连接池、缓存客户端等）
+    # TODO: 在此添加更多资源初始化（DB 连接池、缓存客户端等）
 
-        log.info("Application started | env={} | host={}:{}",
-                 settings.ENVIRONMENT, settings.HOST, settings.PORT)
+    log.info("Application started | env={} | host={}:{}",
+             settings.ENVIRONMENT, settings.HOST, settings.PORT)
 
-        try:
-            yield
-        finally:
-            log.info("Application shutting down...")
+    try:
+        yield
+    finally:
+        log.info("Application shutting down...")
 
 
 # ── FastAPI 应用 ──────────────────────────────────────────────
+# fastmcp 3.x: http_app() 返回的 ASGI 子应用自带 lifespan（内部启动/停止
+# StreamableHTTPSessionManager 与 FastMCP lifespan）。path="/" 使 MCP 端点
+# 落在 mount 根路径（/example），与旧版 streamable_http_app() 行为一致；
+# stateless_http=True 启用无状态 HTTP 传输模式。
+example_mcp_app = example.mcp.http_app(path="/", stateless_http=True)
+mojin_chat_mcp_app = mojin_chat.mcp.http_app(path="/", stateless_http=True)
+
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
-    lifespan=lifespan,
+    lifespan=combine_lifespans(lifespan, example_mcp_app.lifespan, mojin_chat_mcp_app.lifespan),
 )
 
 # ── CORS ──────────────────────────────────────────────────────
@@ -69,12 +76,14 @@ if settings.all_cors_origins:
 
 # ── 路由注册 ──────────────────────────────────────────────────
 app.include_router(example.router)
+app.include_router(mojin_chat.router)
 
 # ── MCP 子应用挂载 ────────────────────────────────────────────
-# 每个 FastMCP 实例通过 streamable_http_app() 生成 ASGI 子应用，
+# 每个 FastMCP 实例通过 http_app() 生成 ASGI 子应用，
 # 以 /{module_name} 路径挂载到 FastAPI 上。
 # MCP 客户端通过 http://host:port/{module_name} 连接。
-app.mount("/example", app=example.mcp.streamable_http_app())
+app.mount("/example", app=example_mcp_app)
+app.mount("/mojin_chat", app=mojin_chat_mcp_app)
 
 # ── 日志 ──────────────────────────────────────────────────────
 Loggers.init_config()

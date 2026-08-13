@@ -29,3 +29,6 @@ Thumbs.db
 
 # ── uv ──
 uv.lock
+
+# ── Milvus 本地数据 ──
+data/
