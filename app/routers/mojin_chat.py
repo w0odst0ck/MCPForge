@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections import OrderedDict
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from fastmcp import FastMCP
 from starlette.concurrency import run_in_threadpool
 
@@ -377,25 +379,35 @@ def _run_answer(query: str, lang: str, categories: Optional[List[str]] = None) -
     return result
 
 
-def _run_answer_impl(query: str, lang: str, categories: Optional[List[str]] = None) -> Dict:
-    """RAG 全链路：检索 → rerank → BM25 压缩 → DeepSeek 生成（同步执行，HTTP/MCP 侧跑在线程池）。"""
+# SSE 流式最长时长：LLM 逐 token 生成超过该时长强制收尾（超时 → error 事件 + 转人工）
+STREAM_TIMEOUT_S = 60.0
+
+
+def _prepare_answer(query: str, lang: str, categories: Optional[List[str]] = None):
+    """RAG 前半程：检索 → rerank → BM25 压缩上下文。返回 (top, context, meta_result)。
+
+    - top: [(entity, score)] rerank 后保留的命中文档（生成答案 + 组装 sources 用）
+    - context: 压缩后的知识上下文（喂 LLM）
+    - meta_result: 非 None 表示无需/无法走 LLM（无命中 / 检索失败），直接作为最终结果返回；
+      此时 top/context 为 (None, None)
+
+    同步函数：HTTP/MCP 侧由调用方（run_in_threadpool / StreamingResponse 线程池）执行。
+    """
     t0 = time.perf_counter()
-    lang = _check_lang(lang)
-    log.info("mojin_chat answer start | query={} lang={} categories={}", query, lang, categories)
 
     # 1. 检索
     try:
         merged = _retrieve_kb(query, lang, categories=categories)
     except Exception as e:
         log.error("retrieval failed | err={}", type(e).__name__)
-        return _friendly_error("retrieval", t0, lang)
+        return None, None, _friendly_error("retrieval", t0, lang)
 
     # 2. rerank + 无命中判定（无命中不调 LLM，直接转人工）
     scored = _rerank(merged, query)
     if not scored:
         elapsed = int((time.perf_counter() - t0) * 1000)
         log.info("mojin_chat no hit | query={} lang={} elapsed_ms={}", query, lang, elapsed)
-        return {"answer": HUMAN_HANDOFF[lang], "sources": [], "hit_count": 0, "elapsed_ms": elapsed}
+        return None, None, {"answer": HUMAN_HANDOFF[lang], "sources": [], "hit_count": 0, "elapsed_ms": elapsed}
 
     top = scored[: kb_settings.RERANK_TOP_K]
 
@@ -418,8 +430,20 @@ def _run_answer_impl(query: str, lang: str, categories: Optional[List[str]] = No
                 )
         except Exception as e:
             log.warning("context compression skipped | err={}", type(e).__name__)
+    return top, context, None
 
-    # 4. DeepSeek 生成（失败兜底转人工）
+
+def _run_answer_impl(query: str, lang: str, categories: Optional[List[str]] = None) -> Dict:
+    """RAG 全链路：检索 → rerank → BM25 压缩 → DeepSeek 生成（同步执行，HTTP/MCP 侧跑在线程池）。"""
+    t0 = time.perf_counter()
+    lang = _check_lang(lang)
+    log.info("mojin_chat answer start | query={} lang={} categories={}", query, lang, categories)
+
+    top, context, meta = _prepare_answer(query, lang, categories=categories)
+    if meta is not None:
+        return meta
+
+    # DeepSeek 生成（失败兜底转人工）
     try:
         answer = _llm_chat([
             {"role": "system", "content": _system_prompt(lang, context)},
@@ -437,6 +461,93 @@ def _run_answer_impl(query: str, lang: str, categories: Optional[List[str]] = No
     log.info("mojin_chat answer done | query={} lang={} hit_count={} elapsed_ms={}",
              query, lang, len(top), elapsed)
     return {"answer": answer, "sources": sources, "hit_count": len(top), "elapsed_ms": elapsed}
+
+
+def _llm_chat_stream(messages: List[dict]):
+    """DeepSeek 流式生成（OpenAI 兼容 stream=True），逐 token yield delta 字符串。
+
+    失败向上抛，由调用方（_answer_stream）兜底转人工。
+    """
+    resp = _get_llm().chat.completions.create(
+        model=kb_settings.LLM_MODEL,
+        messages=messages,
+        max_tokens=kb_settings.LLM_MAX_TOKENS,
+        temperature=kb_settings.LLM_TEMPERATURE,
+        stream=True,
+        # 兜底：OpenAI client 默认超时 600s，首 token 卡死会绕开 STREAM_TIMEOUT_S 检查，
+        # 这里用 65s（> 流式 60s 上限）作为真超时防线
+        timeout=65.0,
+    )
+    for chunk in resp:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
+
+
+def _answer_stream(query: str, lang: str):
+    """answer_question 的 SSE 流式生成器：start → token* → done（失败/超时 → error）。
+
+    事件格式（每事件后空行，data 为单行 JSON）：
+        event: start / data: {"hit_count": n, "sources": [...]}
+        event: token / data: {"delta": "..."}
+        event: done  / data: {"answer": "...", "elapsed_ms": n}
+        event: error / data: {"message": "...", "answer": "转人工文案"}
+
+    同步生成器：FastAPI StreamingResponse 在线程池中迭代，检索/LLM 阻塞不占事件循环。
+    不走进程内 TTL 缓存（流式要打字机效果，缓存命中会失去逐 token 推送）。
+    """
+    lang = _check_lang(lang)
+    t0 = time.perf_counter()
+    log.info("mojin_chat answer stream start | query={} lang={}", query, lang)
+
+    def sse(event: str, data: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    # 1. 检索 / rerank / 压缩（无命中或检索失败 → 无 token，直接收尾）
+    top, context, meta = _prepare_answer(query, lang)
+    if meta is not None:
+        yield sse("start", {"hit_count": meta["hit_count"], "sources": meta["sources"]})
+        if meta.get("error"):
+            yield sse("error", {"message": meta["error"], "answer": meta["answer"]})
+        yield sse("done", {"answer": meta["answer"], "elapsed_ms": meta["elapsed_ms"]})
+        _log_qa(None, lang, query, meta)  # 流式同样落日志（可观测性一致）
+        return
+
+    sources = [
+        {"doc_id": m["doc_id"], "title": m["title"], "category": m["category"], "score": round(s, 4)}
+        for m, s in top
+    ]
+    yield sse("start", {"hit_count": len(top), "sources": sources})
+
+    # 2. DeepSeek 流式生成，逐 token 推送（失败/超时 → error + 转人工收尾）
+    messages = [
+        {"role": "system", "content": _system_prompt(lang, context)},
+        {"role": "user", "content": query},
+    ]
+    chunks: List[str] = []
+    err_msg: Optional[str] = None
+    try:
+        for delta in _llm_chat_stream(messages):
+            if time.perf_counter() - t0 > STREAM_TIMEOUT_S:
+                err_msg = "stream timeout"
+                break
+            chunks.append(delta)
+            yield sse("token", {"delta": delta})
+    except Exception as e:
+        log.error("llm stream failed | err={}", type(e).__name__)
+        err_msg = "llm service unavailable"
+    if err_msg:
+        log.warning("answer stream {} | query={} lang={}", err_msg, query, lang)
+        handoff = HUMAN_HANDOFF.get(lang, HUMAN_HANDOFF["en"])
+        yield sse("error", {"message": err_msg, "answer": handoff})
+        chunks = [handoff]
+    answer = "".join(chunks)
+    elapsed = int((time.perf_counter() - t0) * 1000)
+    yield sse("done", {"answer": answer, "elapsed_ms": elapsed})
+    # 流式问答同样落日志（可观测性一致），sources/hit_count 取自检索阶段
+    _log_qa(None, lang, query, {"answer": answer, "sources": sources, "hit_count": len(top), "elapsed_ms": elapsed})
 
 
 def _run_search_products(query: str, lang: str) -> Dict:
@@ -584,14 +695,27 @@ def _run_conversation(session_id: str, query: str, lang: str) -> Dict:
 
 @mcp.tool()
 @router.get("/answer_question")
-async def answer_question(query: str, lang: str = "en") -> Dict:
+async def answer_question(query: str, lang: str = "en", stream: bool = False):
     """基于知识库回答客户问题（RAG 全链路，三语客服）
 
     Args:
         query: 客户问题（支持英语/中文/阿拉伯语）
         lang: 回答语言，en | cn | ar，默认 en
+        stream: 为 true 时返回 SSE 流（打字机效果）：start → token* → done；
+                失败/超时（60s）发 error 事件 + 转人工文案。默认 false 返回 JSON（向后兼容）。
     """
     _check_lang(lang)
+    if stream:
+        log.info("answer_question stream called | query={} lang={}", query, lang)
+        return StreamingResponse(
+            _answer_stream(query, lang),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # 关掉反代/网关缓冲，保证 token 实时到达
+                "Connection": "keep-alive",
+            },
+        )
     log.info("answer_question called | query={} lang={}", query, lang)
     result = await run_in_threadpool(_run_answer, query, lang)
     _log_qa(None, lang, query, result)
